@@ -1084,6 +1084,49 @@ float const** computeFP8DequantScale(float const** alpha_scale_ptr_array,
   return alpha_scale_ptr_array;
 }
 
+// ====================== Workaround: apply per-expert dequant scale post-GEMM ================
+// The TMA WarpSpecialized GEMM epilogue has a bug: it implicitly converts
+// float const** alpha_scale_ptr_array to bool(true) then float(1.0), silently
+// dropping per-expert dequant scales.  This kernel applies them after the GEMM.
+template <typename T>
+__global__ void applyExpertDequantScaleKernel(
+    T* __restrict__ data,
+    int64_t const* __restrict__ expert_first_token_offset,
+    float const* __restrict__ dequant_scales,
+    int num_experts,
+    int64_t cols) {
+  int64_t row = blockIdx.y;
+  int64_t col = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (col >= cols) return;
+
+  // Binary search for the expert owning this row
+  int lo = 0, hi = num_experts - 1;
+  while (lo < hi) {
+    int mid = (lo + hi + 1) / 2;
+    if (expert_first_token_offset[mid] <= row)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+
+  float scale = dequant_scales[lo];
+  int64_t idx = row * cols + col;
+  data[idx] = static_cast<T>(static_cast<float>(data[idx]) * scale);
+}
+
+template <typename T>
+void applyExpertDequantScale(T* data, int64_t const* expert_first_token_offset,
+                             float const* dequant_scales, int num_experts, int64_t cols,
+                             int64_t num_rows, cudaStream_t stream) {
+  if (!dequant_scales || num_rows == 0) return;
+  constexpr int kBlockX = 256;
+  dim3 block(kBlockX);
+  dim3 grid((cols + kBlockX - 1) / kBlockX, num_rows);
+  applyExpertDequantScaleKernel<<<grid, block, 0, stream>>>(
+      data, expert_first_token_offset, dequant_scales, num_experts, cols);
+}
+
+// ====================== FP4 block scaling setup =======================================
 template <class BSConfig>
 __device__ void setupFP4BlockScalingFactors(
     TmaWarpSpecializedGroupedGemmInput& layout_info, int expert, int gemm_m, int gemm_n, int gemm_k,
