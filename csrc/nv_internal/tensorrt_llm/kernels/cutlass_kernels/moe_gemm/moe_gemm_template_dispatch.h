@@ -779,9 +779,11 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       TLLM_THROW("FP4 data type is not supported on SM < 90");
     }
   } else if (sm_ >= 90) {
-    // For SM120+ pure FP8 MoE (not FP8 x FP4), redirect to SM89 (Ada) FP8 kernel implementations.
+    // For SM90+ pure FP8 MoE (not FP8 x FP4), redirect to SM89 (Ada) FP8 kernel implementations.
+    // On Hopper (SM90), the TMA WS epilogue uses a simple (alpha, beta) scalar struct that cannot
+    // handle per-expert alpha_scale_ptr_array.  The SM89 non-TMA-WS kernels handle them correctly.
     if constexpr (use_fp8 && !use_wfp4afp8) {
-      if (sm_ >= 120) {
+      if (sm_ >= 90) {
         cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType,
                                                       cutlass::arch::Sm89, EpilogueTag>(
             inputs, multi_processor_count_);
@@ -871,7 +873,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
     // Do Ampere case instead
     if constexpr (tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<
                       T, WeightType, EpilogueTag>()) {
-      TLLM_CHECK_WITH_INFO(!use_fp8, "No fallback FP8 implementation available");
+      // FP8 fallback is handled by SM89 dispatch (see early return above for SM90+)
       TLLM_CHECK_WITH_INFO(use_w4afp8 || !hopper_inputs.isValid(),
                            "Non-specialized Hopper implementation is being rerouted to fallback "
                            "implementation so input "
