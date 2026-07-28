@@ -1971,6 +1971,23 @@ struct SwigluBiasAdaptor {
   }
 };
 
+struct SituAdaptor {
+  constexpr static bool IS_GLU = true;
+  // Kimi SiTU uses alpha for the gate tanh bound and beta for the up tanh bound.
+  float alpha = 1.0f;
+  float beta = 1.0f;
+  float limit = std::numeric_limits<float>::infinity();
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    cutlass::epilogue::thread::Sigmoid<T> sigmoid{};
+    cutlass::epilogue::thread::Tanh<T> tanh_fn{};
+    T gate_out = tanh_fn(gate * (1.0f / alpha)) * alpha * sigmoid(gate);
+    T linear_out = tanh_fn(linear * (1.0f / beta)) * beta;
+    return gate_out * linear_out;
+  }
+};
+
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 
@@ -2045,6 +2062,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                                             GLUAdaptor<cutlass::epilogue::thread::GELU>>
              : activation_type == ActivationType::SwigluBias
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
+             : activation_type == ActivationType::Situ
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -2308,7 +2327,9 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               decltype(block_scaling_type)::value>,  // Relu2
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
-                              decltype(block_scaling_type)::value>  // Identity
+                              decltype(block_scaling_type)::value>,  // Identity
+          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SituAdaptor,
+                              decltype(block_scaling_type)::value>  // Situ
       };
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };
