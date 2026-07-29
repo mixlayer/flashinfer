@@ -615,7 +615,33 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
   }
   cudaError_t status = cudaGetLastError();
   return status;
-};
+}
+
+/// Low shared-memory variant for paged prefill (CTA_Q=128, CTA_KV=64, NUM_STAGES=1).
+/// Use when device has limited shared memory (e.g. ~101KB on GB10). Plan must be built with
+/// cta_tile_q_override=128 (plan uses same tile as default; this kernel just uses less smem).
+/// Only HEAD_DIM 128 is supported. CTA_Q must stay 128 for NUM_MMA_THREADS assertion.
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
+cudaError_t BatchPrefillWithPagedKVCacheDispatchedLowSmem(Params& params, bool enable_pdl,
+                                                          cudaStream_t stream) {
+  static_assert(HEAD_DIM_QK == 128 && HEAD_DIM_VO == 128, "LowSmem path only supports head_dim 128");
+  if (MASK_MODE == MaskMode::kCustom) {
+    return cudaErrorNotSupported;
+  }
+  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
+  BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+      AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
+                            /*CTA_Q_=*/128,
+                            /*CTA_KV_=*/64,
+                            /*NUM_STAGES_=*/1, typename Params::DTypeQ,
+                            typename Params::DTypeKV, typename Params::DTypeO,
+                            typename Params::IdType, AttentionVariant>,
+      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+      params, stream);
+  return cudaGetLastError();
+}
 
 }  // namespace flashinfer
 

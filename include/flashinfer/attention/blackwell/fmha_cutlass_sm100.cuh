@@ -138,21 +138,24 @@ struct FwdRunner {
     cutlass::Status status = cutlass::Status::kSuccess;
     status = op.can_implement(arguments);
     if (status != cutlass::Status::kSuccess) {
-      std::cerr << "This kernel is not supported. Last CUDA error is: "
-                << cudaGetErrorString(cudaGetLastError()) << std::endl;
+      std::cerr << "SM100 FMHA kernel not supported (status=" << static_cast<int>(status) << "). "
+                << "Last CUDA error: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+      return cudaErrorNotSupported;
     }
 
     status = op.initialize(arguments, workspace_ptr);
     if (status != cutlass::Status::kSuccess) {
-      std::cerr << "Failed to initialize the CUTLASS kernel. Last CUDA error is: "
-                << cudaGetErrorString(cudaGetLastError()) << std::endl;
+      std::cerr << "Failed to initialize SM100 FMHA kernel (status=" << static_cast<int>(status) << "). "
+                << "Last CUDA error: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+      return cudaErrorInvalidConfiguration;
     }
 
     // Run
     status = op.run(stream);
     if (status != cutlass::Status::kSuccess) {
-      std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
-                << cudaGetErrorString(cudaGetLastError()) << std::endl;
+      std::cerr << "Failed to launch SM100 FMHA kernel (status=" << static_cast<int>(status) << "). "
+                << "Last CUDA error: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+      return cudaErrorLaunchFailure;
     }
     return cudaSuccess;
   }

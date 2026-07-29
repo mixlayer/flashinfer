@@ -873,7 +873,8 @@ inline cudaError_t PrefillSM90Plan(
     PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
-    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream,
+    int cta_tile_q_override = 0) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -902,7 +903,9 @@ inline cudaError_t PrefillSM90Plan(
   std::sort(idx_qo_kv_len_vec.begin(), idx_qo_kv_len_vec.end(),
             [](const auto& a, const auto& b) { return std::get<2>(a) > std::get<2>(b); });
   int cta_tile_q = 128;
-  if (head_dim_vo == 64) {
+  if (cta_tile_q_override > 0) {
+    cta_tile_q = cta_tile_q_override;
+  } else if (head_dim_vo == 64) {
     cta_tile_q = 192;
   }
 

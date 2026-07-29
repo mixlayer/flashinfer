@@ -63,11 +63,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using StrideV = StrideV_;
   using Mask = Mask_;
 
+  // Reduce pipeline stages to fit devices with less shared memory (e.g. GB10/SM120 ~101KB per SM).
+  // Default 2 stages for overlap; 1 stage halves Q/K/V smem at cost of some throughput.
+#ifdef FLASHINFER_FMHA_LOW_SMEM
+  static constexpr int StageCountQ = 1;
+  static constexpr int StageCountKV = 1;
+#else
   static constexpr int StageCountQ = 2;
   static constexpr int StageCountKV =
       (sizeof(Element_) == 1)
           ? (get<2>(TileShapeQK{}) == 128 ? 4 : 2)
           : (get<2>(TileShapeQK{}) == 128 || get<2>(TileShapeQK{}) == 64 ? 2 : 1);
+#endif
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;
