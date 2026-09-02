@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
-#include "tvm_ffi_utils.h"
+#include "flashinfer_sys/fused_moe.h"
+
+#include <stdexcept>
 
 namespace moe::dev::routing {
 namespace routingRenormalize {
@@ -415,24 +417,13 @@ int32_t constexpr getMaxNumExperts(int32_t numExperts) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void run(Data const& data, void* stream) {
-  TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr ||
-                 data.mPtrTopKIds != nullptr)
-      << "Routing kernel requires at least one input parameter";
-  if (data.mPtrTopKIds != nullptr) {
-    TVM_FFI_ICHECK(data.mPtrTopKWeights != nullptr)
-        << "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
-           "Renormalize routing.";
+  if (data.mPtrTopKIds == nullptr || data.mPtrTopKWeights == nullptr ||
+      data.mPtrPermutedIdxSize == nullptr || data.mPtrCtaIdxXyToBatchIdx == nullptr ||
+      data.mPtrCtaIdxXyToMnLimit == nullptr || data.mPtrNumNonExitingCtas == nullptr ||
+      data.mTopK > MaxNumTopExperts || data.mNumExperts > NumExpertsLimit ||
+      data.mNumExperts % 4 != 0) {
+    throw std::invalid_argument("invalid precomputed TRTLLM-Gen routing problem");
   }
-  TVM_FFI_ICHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
-                 data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr)
-      << "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers";
-  TVM_FFI_ICHECK_LE(data.mTopK, MaxNumTopExperts)
-      << "Routing kernel expects topK experts <= " << MaxNumTopExperts << ", got " << data.mTopK;
-  TVM_FFI_ICHECK_LE(data.mNumExperts, NumExpertsLimit)
-      << "Routing kernel expects #experts " << data.mNumExperts << " to be no more than "
-      << NumExpertsLimit << ".";
-  TVM_FFI_ICHECK_EQ(data.mNumExperts % 4, 0)
-      << "Routing kernel expects #experts " << data.mNumExperts << " to be a multiple of 4.";
 
   // FIXME: routingIndicesBlockKernel breaks the vllm + gpt-oss DeepEP
   bool const useSingleBlock =
@@ -444,10 +435,9 @@ void run(Data const& data, void* stream) {
                               : MaxNumTokensSingleCluster);
 
   if (!useSingleCluster && !useSingleBlock) {
-    TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr || data.mPtrTopKIds != nullptr)
-        << "When #tokens is large, `mPtrTopKPacked` or `mPtrTopKIds` is a required input.";
-    TVM_FFI_ICHECK(data.mPtrExpertCounts != nullptr)
-        << "When #tokens is large, `mPtrExpertCounts` is a required input.";
+    if (data.mPtrExpertCounts == nullptr) {
+      throw std::invalid_argument("large precomputed routing requires expert counts");
+    }
   }
   uint32_t const numThreadsHist = getMaxNumExperts(data.mNumExperts);
   if (useSingleBlock) {
@@ -501,3 +491,48 @@ void run(Data const& data, void* stream) {
 
 }  // namespace routingRenormalize
 }  // namespace moe::dev::routing
+
+extern "C" FlashinferStatus modeld_trtllm_gen_route_precomputed(
+    const int32_t* topk_ids, const float* topk_weights, int32_t* expert_counts,
+    int32_t* total_padded_tokens, int32_t* expanded_to_permuted,
+    int32_t* permuted_to_token, int32_t* cta_to_batch, int32_t* cta_to_limit,
+    int32_t* non_exiting_ctas, int32_t num_tokens, int32_t num_experts, int32_t top_k,
+    int32_t tile_tokens, int32_t local_expert_offset, int32_t local_num_experts,
+    cudaStream_t stream) {
+  if (!topk_ids || !topk_weights || !expert_counts || !total_padded_tokens ||
+      !expanded_to_permuted || !permuted_to_token || !cta_to_batch || !cta_to_limit ||
+      !non_exiting_ctas || num_tokens <= 0 || num_experts <= 0 || top_k <= 0 ||
+      tile_tokens <= 0 || local_expert_offset < 0 || local_num_experts <= 0) {
+    return FLASHINFER_STATUS_INVALID_ARGUMENT;
+  }
+  try {
+    moe::dev::routing::routingRenormalize::Data routing;
+    routing.mDtypeExpW = batchedGemm::trtllm::gen::Dtype::Fp32;
+    routing.mDtypeElt = batchedGemm::trtllm::gen::Dtype::Bfloat16;
+    routing.mUsePdl = true;
+    routing.mPtrExpertCounts = expert_counts;
+    routing.mPtrPermutedIdxSize = total_padded_tokens;
+    routing.mPtrExpandedIdxToPermutedIdx = expanded_to_permuted;
+    routing.mPtrPermutedIdxToTokenIdx = permuted_to_token;
+    routing.mPtrTopKWeights = const_cast<float*>(topk_weights);
+    routing.mPtrTopKIds = const_cast<int32_t*>(topk_ids);
+    routing.mPtrCtaIdxXyToBatchIdx = cta_to_batch;
+    routing.mPtrCtaIdxXyToMnLimit = cta_to_limit;
+    routing.mPtrNumNonExitingCtas = non_exiting_ctas;
+    routing.mNumTokens = num_tokens;
+    routing.mNumExperts = num_experts;
+    routing.mTopK = top_k;
+    routing.mPaddingLog2 = 31 - __builtin_clz(tile_tokens);
+    routing.mTileTokensDim = tile_tokens;
+    routing.mLocalExpertsStartIdx = local_expert_offset;
+    routing.mLocalExpertsStrideLog2 = 0;
+    routing.mNumLocalExperts = local_num_experts;
+    routing.mDoSoftmaxBeforeTopK = false;
+    routing.mNormTopkProb = false;
+    routing.mApplySoftmaxAfterTopK = false;
+    moe::dev::routing::routingRenormalize::run(routing, reinterpret_cast<void*>(stream));
+    return FLASHINFER_STATUS_SUCCESS;
+  } catch (...) {
+    return FLASHINFER_STATUS_RUNTIME_ERROR;
+  }
+}

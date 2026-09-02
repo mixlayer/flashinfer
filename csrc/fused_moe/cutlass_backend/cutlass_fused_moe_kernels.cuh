@@ -1321,6 +1321,104 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
 #endif
 }
 
+template <class T, class WeightType, class OutputType, class ScaleBiasType>
+__global__ void computeStridesTmaWarpSpecializedLowLatencyKernel(
+    TmaWarpSpecializedGroupedGemmInput layout_info1,
+    TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens, int64_t gemm1_n,
+    int64_t gemm1_k, int64_t gemm2_n, int64_t gemm2_k, int64_t const num_experts_per_node,
+    T const* in1, T const* in2, WeightType const* weights1, WeightType const* weights2,
+    float const* alpha_scale_flat1, float const* alpha_scale_flat2,
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
+    ScaleBiasType const* bias1, ScaleBiasType const* bias2, OutputType* output1,
+    OutputType* output2, int const* num_active_experts_per, int const* active_expert_global_ids,
+    int start_expert) {
+  int const expert = blockIdx.x * blockDim.x + threadIdx.x;
+  if (expert >= num_experts_per_node) {
+    return;
+  }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+  auto const num_tokens_before_expert = expert * num_tokens;
+  bool const is_active_expert = expert < *num_active_experts_per;
+  int const local_expert = is_active_expert ? active_expert_global_ids[expert] - start_expert : -1;
+  auto const gemm_m = is_active_expert ? num_tokens : 0;
+
+  layout_info1.shape_info.problem_shapes[expert] =
+      TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(gemm1_n, gemm_m,
+                                                                               gemm1_k);
+  layout_info2.shape_info.problem_shapes[expert] =
+      TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(gemm2_n, gemm_m,
+                                                                               gemm2_k);
+  if (alpha_scale_flat1) {
+    assert(alpha_scale_flat2);
+    layout_info1.alpha_scale_ptr_array[expert] =
+        is_active_expert ? alpha_scale_flat1 + local_expert : nullptr;
+    layout_info2.alpha_scale_ptr_array[expert] =
+        is_active_expert ? alpha_scale_flat2 + local_expert : nullptr;
+  }
+  auto setupLowLatencyScaling = [&](auto bs_config, auto quant_type) {
+    using Config = decltype(bs_config);
+    auto const scaling_type =
+        std::is_same_v<Config, TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig>
+            ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+    if (quant_type.fc1.weight_block_scale) {
+      setupFP4BlockScalingFactors<Config>(layout_info1, expert, gemm_m, gemm1_n, gemm1_k,
+                                          fp4_act_flat1, quant_type.fc1.weight_block_scale, 0);
+      layout_info1.fpX_block_scaling_factors_act[expert] =
+          is_active_expert ? fp4_act_flat1 : nullptr;
+      layout_info1.fpX_block_scaling_factors_weight[expert] =
+          is_active_expert
+              ? quant_type.fc1.weight_block_scale +
+                    getOffsetWeightSF(local_expert, gemm1_n, gemm1_k, scaling_type)
+              : nullptr;
+    }
+    if (quant_type.fc2.weight_block_scale) {
+      setupFP4BlockScalingFactors<Config>(layout_info2, expert, gemm_m, gemm2_n, gemm2_k,
+                                          fp4_act_flat2, quant_type.fc2.weight_block_scale,
+                                          num_tokens_before_expert);
+      if (!is_active_expert) {
+        layout_info2.fpX_block_scaling_factors_act[expert] = nullptr;
+        layout_info2.fpX_block_scaling_factors_weight[expert] = nullptr;
+      } else {
+        layout_info2.fpX_block_scaling_factors_weight[expert] =
+            quant_type.fc2.weight_block_scale +
+            getOffsetWeightSF(local_expert, gemm2_n, gemm2_k, scaling_type);
+      }
+    }
+  };
+  setupLowLatencyScaling(TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig{},
+                         quant_params.fp4);
+  setupLowLatencyScaling(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
+                         quant_params.fp8_mxfp4);
+  setupLowLatencyScaling(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
+                         quant_params.mxfp8_mxfp4);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert);
+  computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert);
+  if (is_active_expert) {
+    assert(layout_info1.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
+    assert(layout_info2.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
+    computeTmaWarpSpecializedInputPointers(layout_info1, gemm_m, gemm1_n, gemm1_k, 0,
+                                           local_expert, in1, weights1, nullptr, bias1, output1,
+                                           nullptr, nullptr, expert);
+    computeTmaWarpSpecializedInputPointers(
+        layout_info2, gemm_m, gemm2_n, gemm2_k, num_tokens_before_expert, local_expert, in2,
+        weights2, nullptr, bias2, output2, nullptr, nullptr, expert);
+  } else {
+    layout_info1.ptr_act[expert] = nullptr;
+    layout_info2.ptr_act[expert] = nullptr;
+    layout_info1.ptr_weight[expert] = nullptr;
+    layout_info2.ptr_weight[expert] = nullptr;
+    layout_info1.ptr_d[expert] = nullptr;
+    layout_info2.ptr_d[expert] = nullptr;
+  }
+}
+
 // ========================== Permutation things =======================================
 
 template <class T, class U>
@@ -2999,7 +3097,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     // TODO: as for bias, need to get the correct expert id according to the active expert global
     // ids
     TLLM_CHECK_WITH_INFO(fc1_expert_biases == nullptr, "Min latency mode does not support bias.");
-    TLLM_CHECK(use_fp4);
+    TLLM_CHECK(use_fp4 || use_wfp4afp8);
   }
 
   if (using_tma_ws_gemm1) {
@@ -3206,7 +3304,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int64_t const k, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
     cudaStream_t stream, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
+    int* num_active_experts_per, int* active_expert_global_ids, bool skip_finalize,
+    bool enable_pdl) {
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
   bool const using_tma_ws_gemm2 = gemm_runner.isTmaWarpSpecialized(config);
@@ -3214,7 +3313,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   if (min_latency_mode) {
     TLLM_CHECK_WITH_INFO(using_tma_ws_gemm2,
                          "Only TMA warp specialized GEMM is supported in min latency mode.");
-    TLLM_CHECK(use_fp4);
+    TLLM_CHECK(use_fp4 || use_wfp4afp8);
   }
 
   if (fp8_blockscale_gemm_runner) {
@@ -3297,6 +3396,12 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   bool using_fused_finalize =
       tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
   bool has_different_output_type_tma_ws = !using_fused_finalize && using_tma_ws_gemm2;
+
+  if (skip_finalize) {
+    TLLM_CHECK_WITH_INFO(!using_fused_finalize,
+                         "Cannot skip a finalize fused into the GEMM2 epilogue");
+    return;
+  }
 
   if (has_different_output_type_ampere || has_different_output_type_tma_ws) {
     finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
@@ -3698,7 +3803,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   if (min_latency_mode) {
     TLLM_CHECK(use_lora == false);
     TLLM_CHECK(use_awq == false);
-    TLLM_CHECK(use_fp4 == true);
+    TLLM_CHECK(use_fp4 || use_wfp4afp8);
 
     buildMinLatencyActiveExpertMaps(
         min_latency_params.num_active_experts_per_node, min_latency_params.experts_to_token_score,
@@ -3741,7 +3846,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
                 parallelism_config, enable_alltoall, *gemm2_config_, true,
                 min_latency_params.num_active_experts_per_node,
-                min_latency_params.active_expert_global_ids, enable_pdl);
+                min_latency_params.active_expert_global_ids, false, enable_pdl);
     sync_check_cuda_error(stream);
   } else {
     bool fused_prologue_result = false;
@@ -3854,7 +3959,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
         expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
         experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
-        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
+        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr,
+        skip_finalize_, enable_pdl);
     sync_check_cuda_error(stream);
   }
 }
@@ -3950,7 +4056,48 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         UnfusedGemmOutputType* output1, UnfusedGemmOutputType* output2,
         int const* num_active_experts_per, int const* active_expert_global_ids, int start_expert,
         bool enable_pdl, cudaStream_t stream) {
-  TLLM_THROW("Min latency mode is no longer supported");
+  TLLM_CHECK_WITH_INFO(!use_w4_groupwise,
+                       "W4AFP8 and WFP4A16 are not supported in low latency mode");
+  layout_info1.ptr_c = nullptr;
+  layout_info1.stride_c = nullptr;
+  layout_info2.ptr_c = nullptr;
+  layout_info2.stride_c = nullptr;
+
+  auto alpha_scale_flat1 = use_fp4        ? quant_params.fp4.fc1.global_scale
+                           : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc1.global_scale
+                                          : fp8_dequant1;
+  auto alpha_scale_flat2 = use_fp4        ? quant_params.fp4.fc2.global_scale
+                           : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc2.global_scale
+                                          : fp8_dequant2;
+  if (!alpha_scale_flat1) layout_info1.alpha_scale_ptr_array = nullptr;
+  if (!alpha_scale_flat2) layout_info2.alpha_scale_ptr_array = nullptr;
+  layout_info1.int4_groupwise_params.enabled = false;
+  layout_info2.int4_groupwise_params.enabled = false;
+  layout_info1.int4_groupwise_params.use_wfp4a16 = false;
+  layout_info2.int4_groupwise_params.use_wfp4a16 = false;
+  layout_info1.fpX_block_scaling_type = getScalingType();
+  layout_info2.fpX_block_scaling_type = getScalingType();
+
+  int const threads = std::min(1024, num_experts);
+  int const blocks = (num_experts + threads - 1) / threads;
+  cudaLaunchConfig_t config;
+  config.gridDim = blocks;
+  config.blockDim = threads;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  cudaLaunchKernelEx(
+      &config,
+      computeStridesTmaWarpSpecializedLowLatencyKernel<T, WeightType, OutputType, ScaleBiasType>,
+      layout_info1, layout_info2, num_tokens, gemm1_n, gemm1_k, gemm2_n, gemm2_k, num_experts,
+      input1, input2, weights1, weights2, alpha_scale_flat1, alpha_scale_flat2, fc1_fp4_act_flat,
+      fc2_fp4_act_flat, quant_params, bias1, bias2, output1, output2, num_active_experts_per,
+      active_expert_global_ids, start_expert);
+  return std::make_pair(layout_info1, layout_info2);
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,

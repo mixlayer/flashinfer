@@ -673,7 +673,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       void* fc2_lora, cudaStream_t stream, MOEParallelismConfig parallelism_config,
       bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config,
       bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
-      bool enable_pdl);
+      bool skip_finalize, bool enable_pdl);
 
   // Overrides to allow us to forward on to the internal functions with the pointers using the
   // correct type
@@ -737,7 +737,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
         num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, unpadded_hidden_size,
         inter_size, num_experts_per_node, experts_per_token, alpha_scale_ptr_array, use_lora,
         fc2_lora, stream, parallelism_config, enable_alltoall, config, min_latency_mode,
-        num_active_experts_per, active_expert_global_ids, enable_pdl);
+        num_active_experts_per, active_expert_global_ids, false, enable_pdl);
   }
 
   virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const override {
@@ -793,6 +793,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
         reinterpret_cast<UnfusedGemmOutputType*>(output2), num_active_experts_per,
         active_expert_global_ids, start_expert, enable_pdl, stream);
   }
+
+  void* getUnfinalizedFc2Result() const { return fc2_result_; }
+
+  void setSkipFinalize(bool skip_finalize) { skip_finalize_ = skip_finalize; }
 
  private:
   std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
@@ -935,6 +939,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   void* glu_inter_result_{};
   void* fc2_result_{};
+  bool skip_finalize_{};
   T* fc1_result_{};
   // TODO If we fuse the quantization for GEMM2 into GEMM1 we will need two pointers
   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_fp4_act_scale_;

@@ -705,7 +705,14 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams<T> {
   void* shared_expert_output = nullptr;
   // [num_tokens, top_k]
   int32_t* expanded_idx_to_permuted_idx = nullptr;
+  // [num_tokens, top_k], containing global expert ids
+  int32_t* token_selected_experts = nullptr;
+  int num_experts_per_node = 0;
+  int start_expert_id = 0;
   // allreduce_in [maxPermutedPaddedCount, hidden_dim]
+  bool shared_after_allreduce = false;
+  void* debug_finalized_output = nullptr;
+  bool debug = false;
 };
 
 template <int NRanks>
@@ -806,30 +813,34 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
   if constexpr (AllReduceOut) {
     val.store(reinterpret_cast<T*>(params.moe_allreduce_out) + access_id * VEC_SIZE);
   }
-  vec_t<T, VEC_SIZE> residual_val;
-  residual_val.load(reinterpret_cast<T*>(params.residual_in) + access_id * VEC_SIZE);
-
-  vec_t<T, VEC_SIZE> gamma_val;
-  gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) + access_id_in_token * VEC_SIZE);
-  residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
-  if constexpr (ResidualOut) {
-    residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
-  }
-  vec_t<T, VEC_SIZE> norm_val;
-  norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
-  if constexpr (NormOut) {
-    norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
-  }
+  if constexpr (ResidualOut || NormOut || QuantOut) {
+    vec_t<T, VEC_SIZE> residual_val;
+    residual_val.load(reinterpret_cast<T*>(params.residual_in) + access_id * VEC_SIZE);
+    residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
+    if constexpr (ResidualOut) {
+      residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
+    }
+    if constexpr (NormOut || QuantOut) {
+      vec_t<T, VEC_SIZE> gamma_val;
+      gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) + access_id_in_token * VEC_SIZE);
+      vec_t<T, VEC_SIZE> norm_val;
+      norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
+      if constexpr (NormOut) {
+        norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
+      }
 #if CUDA_VERSION >= 12080
-  if constexpr (QuantOut) {
-    constexpr int SF_VEC_SIZE = 16;
-    auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-        std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
-        params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
-    reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
-        utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
-  }
+      if constexpr (QuantOut) {
+        constexpr int SF_VEC_SIZE = 16;
+        auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
+            std::nullopt /* batchIdx */, token_id, access_id_in_token,
+            std::nullopt /* numRows */, params.hidden_dim,
+            reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
+        reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
+            utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
+      }
 #endif
+    }
+  }
 }
 
 template <typename T>
@@ -1269,6 +1280,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
   int clear_access = comm.clear_size / VEC_SIZE;
 
   // * MoE related
+  __shared__ float debug_max_diff;
   int threadid_in_cluster = cluster.thread_rank();
   // Start Offset within one token's hidden_size of element
   // Current thread handle token[thread_offset_within_token : thread_offset_within_token +
@@ -1286,21 +1298,23 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     }
 
     // * MoE finalize
-    vec_t<T, VEC_SIZE> accumulator;
+    using AccumulatorType = std::conditional_t<std::is_same_v<ScaleType, float>, float, T>;
+    vec_t<AccumulatorType, VEC_SIZE> accumulator;
     accumulator.fill(0.f);
 
     for (int k = 0; k < top_k; k++) {
-      int const expanded_idx = token_id * top_k + k;
-      int32_t const permuted_idx = params.expanded_idx_to_permuted_idx[expanded_idx];
-
-      if (permuted_idx == -1) continue;
+      int const scale_idx = token_id * top_k + k;
+      int const expert_id = params.token_selected_experts[scale_idx] - params.start_expert_id;
+      if (expert_id < 0 || expert_id >= params.num_experts_per_node) continue;
+      int const mapping_idx = token_id + k * num_token;
+      int32_t const permuted_idx = params.expanded_idx_to_permuted_idx[mapping_idx];
 
       int thread_offset_across_token =
           permuted_idx * params.hidden_dim + thread_offset_within_token;
       float block_scale = 1.0;
       if (use_scale_factor) {
         block_scale =
-            static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
+            static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[scale_idx]);
       }
 
       vec_t<T, VEC_SIZE> permuted_data;
@@ -1309,31 +1323,61 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       // * acc += scale(data)
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
-        // assume computation is done in ScaleType
-        accumulator[i] += static_cast<T>(static_cast<float>(permuted_data[i]) * block_scale);
+        accumulator[i] += static_cast<AccumulatorType>(static_cast<float>(permuted_data[i]) *
+                                                       block_scale);
       }
     }
 
     // * Add shared expert output
-    if (params.shared_expert_output) {
+    if (params.shared_expert_output && !params.shared_after_allreduce) {
       // * Load shared expert output
       int thread_offset_across_token = token_id * params.hidden_dim + thread_offset_within_token;
       vec_t<T, VEC_SIZE> shared_expert_output;
       shared_expert_output.load(reinterpret_cast<T*>(params.shared_expert_output) +
                                 thread_offset_across_token);
 #pragma unroll
-      accumulator = vec_add<T, VEC_SIZE>(accumulator, shared_expert_output);
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        accumulator[i] += static_cast<AccumulatorType>(shared_expert_output[i]);
+      }
+    }
+
+    if (params.debug && token_id == 0 && threadid_in_cluster == 0) {
+      int32_t const first_permuted_idx = params.expanded_idx_to_permuted_idx[0];
+      float const first_scale = use_scale_factor
+                                    ? static_cast<float>(
+                                          static_cast<ScaleType*>(params.expert_scale_factor)[0])
+                                    : 1.0f;
+      float const first_fc2 = first_permuted_idx >= 0
+                                  ? static_cast<float>(reinterpret_cast<T*>(params.allreduce_in)
+                                                           [first_permuted_idx * params.hidden_dim])
+                                  : 0.0f;
+      float const first_shared = params.shared_expert_output
+                                     ? static_cast<float>(reinterpret_cast<T*>(
+                                           params.shared_expert_output)[0])
+                                     : 0.0f;
+      float const first_finalized = params.debug_finalized_output
+                                        ? static_cast<float>(reinterpret_cast<T*>(
+                                              params.debug_finalized_output)[0])
+                                        : 0.0f;
+      printf("[moe-finalize-debug] rank=%d map0=%d scale0=%f fc2_0=%f shared_0=%f acc_0=%f standard_0=%f\n",
+             params.rank, first_permuted_idx, first_scale, first_fc2, first_shared,
+             static_cast<float>(accumulator[0]), first_finalized);
     }
 
     // * AR Store
     int idx = token_id * params.hidden_dim / VEC_SIZE + access_id_in_token;
-    remove_neg_zero<T, VEC_SIZE>(accumulator);
+    vec_t<T, VEC_SIZE> reduced_output;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      reduced_output[i] = static_cast<T>(accumulator[i]);
+    }
+    remove_neg_zero<T, VEC_SIZE>(reduced_output);
 
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       // STG.128 to remote rank
       int offset = (params.rank * tot_access + idx) * VEC_SIZE;
-      accumulator.store_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
+      reduced_output.store_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) + offset);
     }
   }
 
@@ -1353,7 +1397,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
         // LDG.128 from local rank
-        vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[r]) +
+        vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
                                      (r * tot_access + idx) * VEC_SIZE);
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
@@ -1364,9 +1408,60 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       sum_val = vec_add<T, VEC_SIZE>(sum_val, vals[r]);
     }
 
-    // * Fuse: AllReduceOut is always false in finalize_moe_allreduce
-    fused_op<false, ResidualOut, NormOut, QuantOut, T, VEC_SIZE>(sum_val, idx, tidx,
-                                                                 access_id_in_token, params);
+    if (params.shared_expert_output && params.shared_after_allreduce) {
+      vec_t<T, VEC_SIZE> shared_expert_output;
+      shared_expert_output.load(reinterpret_cast<T*>(params.shared_expert_output) +
+                                tidx * params.hidden_dim + access_id_in_token * VEC_SIZE);
+      sum_val = vec_add<T, VEC_SIZE>(sum_val, shared_expert_output);
+    }
+
+    if (params.debug) {
+      if (threadIdx.x == 0) debug_max_diff = 0.0f;
+      __syncthreads();
+      vec_t<T, VEC_SIZE> reference_val;
+      reference_val.load(reinterpret_cast<T*>(params.debug_finalized_output) + idx * VEC_SIZE);
+      if (params.shared_expert_output && params.shared_after_allreduce) {
+        vec_t<T, VEC_SIZE> shared_expert_output;
+        shared_expert_output.load(reinterpret_cast<T*>(params.shared_expert_output) +
+                                  tidx * params.hidden_dim + access_id_in_token * VEC_SIZE);
+        reference_val = vec_add<T, VEC_SIZE>(reference_val, shared_expert_output);
+      }
+      float max_diff = 0.0f;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        max_diff = fmaxf(max_diff, fabsf(static_cast<float>(sum_val[i]) -
+                                        static_cast<float>(reference_val[i])));
+      }
+      atomicMax(reinterpret_cast<int*>(&debug_max_diff), __float_as_int(max_diff));
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        printf("[moe-finalize-ar-debug] rank=%d token=%d block=%d sum_0=%f reference_0=%f max_diff=%f\n",
+               params.rank, tidx, cluster.block_rank(), static_cast<float>(sum_val[0]),
+               static_cast<float>(reference_val[0]), debug_max_diff);
+      }
+    }
+
+    fused_op<true, ResidualOut, NormOut, QuantOut, T, VEC_SIZE>(sum_val, idx, tidx,
+                                                                access_id_in_token, params);
+    if (params.debug) {
+      if (threadIdx.x == 0) debug_max_diff = 0.0f;
+      __syncthreads();
+      vec_t<T, VEC_SIZE> stored_val;
+      stored_val.load(reinterpret_cast<T*>(params.moe_allreduce_out) + idx * VEC_SIZE);
+      float max_diff = 0.0f;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        max_diff = fmaxf(max_diff, fabsf(static_cast<float>(sum_val[i]) -
+                                        static_cast<float>(stored_val[i])));
+      }
+      atomicMax(reinterpret_cast<int*>(&debug_max_diff), __float_as_int(max_diff));
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        printf("[moe-finalize-store-debug] rank=%d token=%d block=%d output_0=%f max_diff=%f\n",
+               params.rank, tidx, cluster.block_rank(), static_cast<float>(stored_val[0]),
+               debug_max_diff);
+      }
+    }
   }
   comm.update(params.size * NRanks);
   cudaTriggerProgrammaticLaunchCompletion();
@@ -1466,7 +1561,7 @@ cudaError_t moefinalize_allreduce_fusion_kernel_launcher(
     }                                                                                          \
   }()
 
-template <typename T>
+template <typename T, typename ScaleType = T>
 cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams<T> const& params,
                                             bool launch_with_pdl) {
   static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
@@ -1485,7 +1580,7 @@ cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams<T> 
           return cudaErrorNotSupported;
         }
         FLASHINFER_CUDA_CALL(
-            (moefinalize_allreduce_fusion_kernel_launcher<T, N_RANKS, RES, RMS, QUANT>(
+            (moefinalize_allreduce_fusion_kernel_launcher<T, N_RANKS, RES, RMS, QUANT, ScaleType>(
                 (params), (launch_with_pdl))));
       });
   return status;
